@@ -1,0 +1,724 @@
+---
+title: "R Code"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load libraries
+```{r, cache=TRUE}
+library(leaps)
+library(glmnet)
+library(tree)
+library(MASS)
+library(randomForest)
+library(gbm)
+library(ISLR2)
+library(pls)
+library(mgcv)
+library(ggplot2)
+library(caret) 
+library(splines)
+```
+
+
+# Load data from CSV file
+```{r, cache=TRUE}
+df = read.csv("wine-quality-white-and-red.csv")
+head(df)
+sum(is.na(df))
+```
+
+# Split data into 2 separate white wine and red wine datasets
+```{r, cache=TRUE}
+df_white = subset(df, type=="white")
+df_white = df_white[,-1] # remove type column
+head(df_white)
+df_red = subset(df, type=="red")
+df_red = df_red[,-1] # remove type column
+head(df_red)
+```
+
+# Exploratory Data Analysis
+```{r, cache=TRUE}
+# counts
+print("Red Wine Sample Size: ")
+length(df_red$chlorides)
+print("White Wine Sample Size: ")
+length(df_white$chlorides)
+
+# counts of each quality value
+table(df_white$quality)
+table(df_red$quality)
+
+# Define predictor names and datasets
+predictors <- c("alcohol", "volatile.acidity", "citric.acid", "sulphates", 
+                "fixed.acidity", "residual.sugar", "chlorides", 
+                "free.sulfur.dioxide", "total.sulfur.dioxide", "density", "pH")
+# puts the separate white and red wine datasets into a list 
+datasets <- list(df_red = df_red, df_white = df_white)
+```
+
+```{r, cache=TRUE}
+# Distributions
+for (data_name in names(datasets)) {
+  data <- datasets[[data_name]]
+  par(mfrow = c(2, 3))
+    for (pred in predictors) {
+      hist(data[[pred]], main = paste(data_name, pred), xlab = pred)
+    }
+}
+```
+
+```{r, cache=TRUE}
+# correlation matrix
+for (data_name in names(datasets)) {
+  data <- datasets[[data_name]]
+  print(data_name)
+  cor_matrix <- cor(data[, predictors])
+  print(cor_matrix)
+}
+```
+
+```{r, cache=TRUE}
+# find outliers with boxplots
+for (data_name in names(datasets)) {
+  data <- datasets[[data_name]]
+  par(mfrow = c(1, 3))  # Arrange plots
+    for (pred in predictors) {
+      boxplot(data[[pred]], main = paste(data_name, pred), xlab = pred)
+    }
+}
+```
+
+## Logistic Regression
+```{r, cache=TRUE}
+median(df_white$quality)
+median(df_red$quality)
+# median is 6, but cutoff is uneven; I use five because this cutoff is slightly 
+# less uneven. This is true for both white and red.
+# sum(white$quality<=6)-sum(white$quality>6) = 2788
+# sum(white$quality>5)-sum(white$quality<=5) = 1618
+# sum(red$quality<=6)-sum(red$quality>6) = 1165
+# sum(red$quality>5)-sum(red$quality<=5) = 111
+
+dftmp_white = df_white
+dftmp_red = df_red
+# creating a new column for response
+dftmp_white$highquality <- as.integer(dftmp_white$quality>5)
+dftmp_red$highquality <- as.integer(dftmp_red$quality>5)
+
+datasetstmp <- list(dftmp_white = dftmp_white, dftmp_red = dftmp_red)
+results = list()
+results_wrongs = list()
+for (data_name in names(datasetstmp)) {
+  df_current <- datasetstmp[[data_name]]
+  set.seed(5)
+  errorrate = numeric(10)
+  wrongs <- c() #vector of true qualities of mispredicted low/high wines
+  for (i in 1:10){
+    trainind <- sample(1:nrow(df_current), nrow(df_current)/2)
+    
+    df_currenttrain <- df_current[trainind,][-12] #getting rid of "quality" variable
+    df_currenttest <- df_current[-trainind,][-12]
+    
+    trainq <- as.vector(df_current[trainind,][12])$quality # "quality" column for training data
+    testq <- as.vector(df_current[-trainind,][12])$quality # "quality" column for test data
+    
+    df_currentlogistic <- glm(highquality ~ ., data=df_currenttrain, family="binomial")
+
+    response <- predict(df_currentlogistic, newdata = df_currenttest, type="response")
+    response <- as.integer(response>0.5)
+    
+    tab <- table(Predicted = response, Actual = df_currenttest$highquality) #table of results
+    errorrate[i] <- (tab[1,2]+tab[2,1])/sum(tab)
+    for (i in 1:nrow(df_currenttest)){
+        if ((df_currenttest$highquality)[i] != response[i]) {
+            wrongs <- c(wrongs, testq[i])
+        }
+    }
+  }
+  results[[data_name]] = mean(errorrate)
+  results_wrongs[[data_name]] = sum(wrongs==5 | wrongs==6)/length(wrongs)
+}
+results
+results_wrongs
+```
+
+## Multiple Linear Regression
+```{r, cache=TRUE}
+results = list()
+# as a reminder: datasets is a list with one item as white wine dataset and 
+# another item as red wine dataset
+for (data_name in names(datasets)) {
+  df_current <- datasets[[data_name]]
+  set.seed(5)
+  mse = rep(NA,10)
+  for (i in 1:10){
+    trainind <- sample(1:nrow(df_current), nrow(df_current)/2)
+    train <- df_current[trainind,]
+    test <- df_current[-trainind,]
+    df_currentlm <- lm(quality ~ ., data=train)
+    predictions <- predict(df_currentlm, newdata = test)
+    
+    mse[i] <- mean((predictions - test$quality)^2)
+  }
+  results[[data_name]] = mean(mse)
+}
+results
+```
+
+# Subset Selection
+## Best Subset Selection
+```{r, cache=TRUE}
+results = list()
+for (data_name in names(datasets)) {
+  df_current <- datasets[[data_name]]
+  set.seed(5)
+  mse = rep(NA,10)
+  # validation set approach: repeat 10 times
+  for (i in 1:10) {
+    train = sample(1:nrow(df_current), nrow(df_current)/2)
+    # best subset selection with max # of variables=11 on training data
+    regfit.best=regsubsets(quality~.,data=df_current[train,],nvmax=11) 
+    # create an X matrix of test data
+    test.mat=model.matrix(quality~.,data=df_current[-train,]) 
+    val.errors=rep(NA,11)
+    for(j in 1:11){ 
+       coefj=coef(regfit.best,id=j)
+       pred=test.mat[,names(coefj)]%*%coefj
+       # calculate MSE on validation set
+       val.errors[j]=mean((df_current$quality[-train] - pred)^2)
+    }
+    # keep smallest MSE
+    mse[i] = min(val.errors)
+  }
+  # average MSE
+  results[[data_name]] = mean(mse)
+}
+results
+```
+
+## Forward Stepwise Selection
+```{r, cache=TRUE}
+results = list()
+for (data_name in names(datasets)) {
+  df_current <- datasets[[data_name]]
+  set.seed(5)
+  mse = rep(NA,10)
+  # validation set approach: repeat 10 times
+  for (i in 1:10) {
+    train = sample(1:nrow(df_current), nrow(df_current)/2)
+    # forward selection with max # of variables=11 on training data
+    regfit.forward=regsubsets(quality~.,data=df_current[train,],nvmax=11,
+                           method="forward") 
+    # create an X matrix of test data
+    test.mat=model.matrix(quality~.,data=df_current[-train,]) 
+    val.errors=rep(NA,11)
+    for(j in 1:11){ 
+       coefj=coef(regfit.forward,id=j)
+       pred=test.mat[,names(coefj)]%*%coefj
+       # calculate MSE on validation set
+       val.errors[j]=mean((df_current$quality[-train] - pred)^2)
+    }
+    # keep smallest MSE
+    mse[i] = min(val.errors)
+  }
+  # average MSE
+  results[[data_name]] = mean(mse)
+}
+results
+```
+
+## Backward Stepwise Selection
+```{r, cache=TRUE}
+results = list()
+for (data_name in names(datasets)) {
+  df_current <- datasets[[data_name]]
+  set.seed(5)
+  mse = rep(NA,10)
+  # validation set approach: repeat 10 times
+  for (i in 1:10) {
+    train = sample(1:nrow(df_current), nrow(df_current)/2)
+    # backward selection with max # of variables=11 on training data
+    regfit.backward=regsubsets(quality~.,data=df_current[train,],nvmax=11,
+                           method="backward") 
+    # create an X matrix of test data
+    test.mat=model.matrix(quality~.,data=df_current[-train,]) 
+    val.errors=rep(NA,11)
+    for(j in 1:11){ 
+       coefj=coef(regfit.backward,id=j)
+       pred=test.mat[,names(coefj)]%*%coefj
+       # calculate MSE on validation set
+       val.errors[j]=mean((df_current$quality[-train] - pred)^2)
+    }
+    # keep smallest MSE
+    mse[i] = min(val.errors)
+  }
+  # average MSE
+  results[[data_name]] = mean(mse)
+}
+results
+```
+
+# Shrinkage Methods
+## Ridge Regression
+```{r, cache=TRUE}
+results = list()
+for (data_name in names(datasets)) {
+  df_current <- datasets[[data_name]]
+  set.seed(5)
+  mse = rep(NA,10)
+  # validation set approach: repeat 10 times
+  for (i in 1:10) {
+    train = sample(1:nrow(df_current), nrow(df_current)/2)
+    x_train = model.matrix(quality~., df_current[train,])[,-1] # remove intercept
+    y_train = df_current$quality[train]
+    x_valid = model.matrix(quality~., df_current[-train,])[,-1] # remove intercept
+    y_valid = df_current$quality[-train]
+    # 10-fold CV to find best lambda
+    cv.out=cv.glmnet(x_train,y_train,alpha=0,nfolds=10)
+    bestlam=cv.out$lambda.min
+    # training model
+    ridge.mod=glmnet(x_train,y_train,alpha=0,lambda=bestlam)
+    # predict on validation set
+    pred = predict(ridge.mod, s=bestlam, newx=x_valid)
+    mse[i] = mean((y_valid - pred)^2)
+  }
+  results[[data_name]] = mean(mse)
+}
+results
+```
+
+## Lasso Regression
+```{r, cache=TRUE}
+results = list()
+for (data_name in names(datasets)) {
+  df_current <- datasets[[data_name]]
+  set.seed(5)
+  mse = rep(NA,10)
+  # validation set approach: repeat 10 times
+  for (i in 1:10) {
+    train = sample(1:nrow(df_current), nrow(df_current)/2)
+    x_train = model.matrix(quality~., df_current[train,])[,-1] # remove intercept
+    y_train = df_current$quality[train]
+    x_valid = model.matrix(quality~., df_current[-train,])[,-1] # remove intercept
+    y_valid = df_current$quality[-train]
+    # 10-fold CV to find best lambda
+    cv.out=cv.glmnet(x_train,y_train,alpha=1,nfolds=10)
+    bestlam=cv.out$lambda.min
+    # training model
+    lasso.mod=glmnet(x_train,y_train,alpha=1,lambda=bestlam)
+    # predict on validation set
+    pred = predict(lasso.mod, s=bestlam, newx=x_valid)
+    mse[i] = mean((y_valid - pred)^2)
+  }
+  results[[data_name]] = mean(mse)
+}
+results
+```
+
+# Dimension Reduction Methods
+## Principal Components Regression (PCR)
+```{r, cache=TRUE}
+results_pcr <- list()
+
+for (data_name in names(datasets)) {
+  df <- datasets[[data_name]]
+  set.seed(5)
+  mse_results <- rep(NA, 10)
+
+  for (i in 1:10) {
+    # Split data into training (50%) and validation (50%) sets
+    train_index <- sample(1:nrow(df), nrow(df)/2)
+    train_data <- df[train_index, ]
+    test_data <- df[-train_index, ]
+
+    # Max number of principal components to test
+    max_comp <- min(ncol(train_data) - 1, nrow(train_data) - 1)
+
+    # Cross-validation setup
+    folds <- createFolds(train_data$quality, k = 10)
+    cv_errors <- matrix(NA, nrow = 10, ncol = max_comp)
+
+    for (fold in 1:10) {
+      val_indices <- folds[[fold]]
+      cv_train <- train_data[-val_indices, ]
+      cv_val <- train_data[val_indices, ]
+
+      # Fit PCR model since there's no auto cv do it manually
+      pcr_model <- pcr(quality ~ ., data = cv_train, scale = TRUE, validation = "none")
+
+      for (j in 1:max_comp) {
+        pred <- predict(pcr_model, newdata = cv_val, ncomp = j)
+        cv_errors[fold, j] <- mean((cv_val$quality - pred)^2)
+      }
+    }
+
+    # Select optimal number of components from CV
+    avg_cv_errors <- colMeans(cv_errors)
+    best_comp <- which.min(avg_cv_errors)
+
+    # Fit final PCR model with best number of components
+    final_pcr_model <- pcr(quality ~ ., data = train_data, scale = TRUE, validation = "none")
+    final_pred <- predict(final_pcr_model, newdata = test_data, ncomp = best_comp)
+
+    mse_results[i] <- mean((test_data$quality - final_pred)^2)
+  }
+
+  results_pcr[[data_name]] <- mean(mse_results)  # Mean MSE 
+}
+
+results_pcr
+```
+
+## Partial Least Squares (PLS)
+```{r, cache=TRUE}
+results_pls <- list()
+
+for (data_name in names(datasets)) {
+  df <- datasets[[data_name]]
+  set.seed(5)
+  mse_results <- rep(NA, 10)
+
+  for (i in 1:10) {
+    # Split data into training (50%) and validation (50%) sets
+    train_index <- sample(1:nrow(df), nrow(df)/2)
+    train_data <- df[train_index, ]
+    test_data <- df[-train_index, ]
+
+    # Max number of PLS components to test
+    max_comp <- min(ncol(train_data) - 1, nrow(train_data) - 1)
+
+    # Cross-validation setup
+    folds <- createFolds(train_data$quality, k = 10)
+    cv_errors <- matrix(NA, nrow = 10, ncol = max_comp)
+
+    for (fold in 1:10) {
+      val_indices <- folds[[fold]]
+      cv_train <- train_data[-val_indices, ]
+      cv_val <- train_data[val_indices, ]
+
+      # Fit PLS model (manual CV)
+      pls_model <- plsr(quality ~ ., data = cv_train, scale = TRUE, validation = "none")
+
+      for (j in 1:max_comp) {
+        pred <- predict(pls_model, newdata = cv_val, ncomp = j)
+        cv_errors[fold, j] <- mean((cv_val$quality - pred)^2)
+      }
+    }
+
+    # Select optimal number of components from CV
+    avg_cv_errors <- colMeans(cv_errors)
+    best_comp <- which.min(avg_cv_errors)
+
+    # Fit final PLS model with best number of components
+    final_pls_model <- plsr(quality ~ ., data = train_data, scale = TRUE, validation = "none")
+    final_pred <- predict(final_pls_model, newdata = test_data, ncomp = best_comp)
+
+    mse_results[i] <- mean((test_data$quality - final_pred)^2)
+  }
+
+  results_pls[[data_name]] <- mean(mse_results)  # Mean MSE
+}
+
+results_pls
+```
+
+# Nonlinear Methods
+## Polynomial Regression
+```{r, cache = TRUE}
+results_poly <- list()
+
+for (data_name in names(datasets)) {
+  df <- datasets[[data_name]]
+  set.seed(5)
+  mse_values <- rep(NA, 10)
+
+  for (i in 1:10) {
+    # Split data
+    train_index <- sample(1:nrow(df), nrow(df)/2)
+    train <- df[train_index, ]
+    test <- df[-train_index, ]
+
+    # Cross-validation to select best degree (1 to 10)
+    cv_errors <- rep(NA, 4)
+    for (d in 1:3) {
+      predictors <- paste0("poly(", names(train)[-which(names(train) == "quality")],
+                           ", ", d, ", raw = TRUE)", collapse = " + ")
+      formula <- as.formula(paste0("quality ~ ", predictors))
+
+      cv_model <- train(
+        formula, data = train, method = "lm",
+        trControl = trainControl(method="cv", number=10)
+      )
+
+      cv_errors[d] <- min(cv_model$results$RMSE)^2
+    }
+
+    best_degree <- which.min(cv_errors)
+
+    # Fit best model on full training set
+    final_predictors <- paste0("poly(", names(train)[-which(names(train) == "quality")], 
+                               ", ", best_degree, ", raw = TRUE)", collapse = " + ")
+    final_formula <- as.formula(paste0("quality ~ ", final_predictors))
+
+    final_model <- lm(final_formula, data = train)
+    predictions <- predict(final_model, newdata = test)
+    mse_values[i] <- mean((predictions - test$quality)^2)
+  }
+
+  results_poly[[data_name]] <- mean(mse_values)  # Mean MSE
+}
+
+results_poly
+```
+
+## Basis Functions
+```{r, cache = TRUE}
+results_basis <- list()
+poly_degrees <- 1:3
+
+for (data_name in names(datasets)) {
+  df <- datasets[[data_name]]
+  set.seed(5)
+  predictors <- df[, setdiff(names(df), "quality")]  # Keep all predictors
+
+  mse <- matrix(NA, nrow=10, ncol=length(poly_degrees))
+
+  for (i in 1:10) {
+    train <- sample(1:nrow(df), nrow(df)/2)
+    x_train <- predictors[train, ]
+    y_train <- df$quality[train]
+    x_valid <- predictors[-train, ]
+    y_valid <- df$quality[-train]
+
+    for (j in seq_along(poly_degrees)) {
+      # Apply polynomial transformation to all predictors
+      x_train_poly <- as.data.frame(lapply(x_train, 
+                                           function(var) poly(var, poly_degrees[j])))
+      x_valid_poly <- as.data.frame(lapply(x_valid, 
+                                           function(var) poly(var, poly_degrees[j])))
+
+      # Name transformed variables
+      colnames(x_train_poly) <- unlist(lapply(names(x_train), 
+                                              function(var) paste(var, "poly",
+                                                                  1:poly_degrees[j],
+                                                                  sep="_")))
+      colnames(x_valid_poly) <- unlist(lapply(names(x_valid), 
+                                              function(var) paste(var, "poly",
+                                                                  1:poly_degrees[j],
+                                                                  sep="_")))
+
+      # Fit model using all transformed predictors
+      poly_mod <- train(y_train ~ ., data=cbind(y_train, x_train_poly), method="lm",
+                        trControl=trainControl(method="cv", number=10))
+
+      # Predict and store MSE
+      pred <- predict(poly_mod, newdata=x_valid_poly)
+      mse[i, j] <- mean((y_valid - pred)^2)
+    }
+  }
+  
+  results_basis[[data_name]] <- mean(rowMeans(mse))  # Mean MSE across 10 iterations
+}
+
+results_basis
+```
+
+## Smoothing Splines
+```{r, cache = TRUE}
+results_smooth <- list()
+df_range <- 2:10
+
+for (data_name in names(datasets)) {
+  df <- datasets[[data_name]]
+  set.seed(5)
+  predictors <- df[, setdiff(names(df), "quality")]
+  mse_results <- rep(NA, 10)  # Store MSE results for validation iterations
+
+  for (i in 1:10) {
+    # Create 50/50 train-validation split
+    train_index <- sample(1:nrow(df), nrow(df)/2)
+    train_data <- df[train_index, ]
+    valid_data <- df[-train_index, ]
+
+    # Set up 10-fold CV
+    folds <- createFolds(train_data$quality, k=10)
+    cv_errors <- matrix(NA, nrow=10, ncol=length(df_range))
+
+    for (fold in 1:10) {
+      val_indices <- folds[[fold]]
+      cv_train <- train_data[-val_indices, ]
+      cv_val <- train_data[val_indices, ]
+
+      for (j in seq_along(df_range)) {
+        pred_matrix <- matrix(NA, nrow=nrow(cv_val), ncol=ncol(cv_train)-1)
+
+        for (p in seq_along(names(cv_train)[-which(names(cv_train) == "quality")])) {
+          predictor_name <- names(cv_train)[p]
+          
+          if (length(unique(cv_train[[predictor_name]])) > df_range[j]) {
+            smooth_model <- smooth.spline(cv_train[[predictor_name]], cv_train$quality,
+                                          df=df_range[j])
+            pred_matrix[, p] <- predict(smooth_model, cv_val[[predictor_name]])$y
+          } else {
+            # Fallback for constant predictors
+            pred_matrix[, p] <- mean(cv_train$quality, na.rm=TRUE)  
+          }
+        }
+
+        cv_errors[fold, j] <- mean((cv_val$quality - rowMeans(pred_matrix))^2)
+      }
+    }
+
+    # Find best df (minimum CV error)
+    avg_cv_errors <- colMeans(cv_errors)
+    best_df <- df_range[which.min(avg_cv_errors)]
+
+    # Fit final model on full training set
+    final_pred_matrix <- matrix(NA, nrow=nrow(valid_data), ncol=ncol(train_data)-1)
+    for (p in seq_along(names(train_data)[-which(names(train_data) == "quality")])) {
+      predictor_name <- names(train_data)[p]
+      
+      if (length(unique(train_data[[predictor_name]])) > best_df) {
+        smooth_model <- smooth.spline(train_data[[predictor_name]], train_data$quality,
+                                      df=best_df)
+        final_pred_matrix[, p] <- predict(smooth_model, valid_data[[predictor_name]])$y
+      } else {
+        final_pred_matrix[, p] <- mean(train_data$quality, na.rm=TRUE)
+      }
+    }
+
+    # Store MSE for this validation iteration
+    mse_results[i] <- mean((valid_data$quality - rowMeans(final_pred_matrix))^2)
+  }
+
+  results_smooth[[data_name]] <- mean(mse_results)  # Mean MSE
+}
+
+results_smooth
+```
+
+## Generalized Additive Model (GAM)
+```{r, cache=TRUE}
+results = list()
+for (data_name in names(datasets)) {
+  df_current <- datasets[[data_name]]
+  set.seed(5)
+  mse = rep(NA,10)
+  for (i in 1:10){
+    trainind <- sample(1:nrow(df_current), nrow(df_current)/2)
+    
+    df_currenttrain <- df_current[trainind,] #getting rid of quality col
+    df_currenttest <- df_current[-trainind,]
+    
+    gam_model_df_current <- gam(quality ~ s(fixed.acidity) + 
+                                  s(volatile.acidity) + s(citric.acid) + 
+                                  s(residual.sugar) + s(chlorides) + 
+                                  s(free.sulfur.dioxide) + 
+                                  s(total.sulfur.dioxide) + s(density) + s(pH) +
+                                  s(sulphates) + s(alcohol), 
+                                data = df_currenttrain)
+    
+    pred_df_current <- predict(gam_model_df_current, df_currenttest)
+
+    true_df_current <- df_currenttest$quality
+    
+    mse[i] <- mean((pred_df_current - true_df_current)^2)
+  }
+  results[[data_name]] = mean(mse)
+}
+results
+```
+
+# Tree-Based Methods
+## Regression Tree 
+```{r, cache=TRUE}
+results = list()
+for (data_name in names(datasets)) {
+  df_current <- datasets[[data_name]]
+  set.seed(5)
+  mse = rep(NA,10)
+  # validation set approach: repeat 10 times
+  for (i in 1:10) {
+    train = sample(1:nrow(df_current), nrow(df_current)/2)
+    # print(train)
+    df_current.test = df_current[-train,"quality"]
+    tree.df_current <- tree(quality~., data=df_current, subset=train)
+    # choose best tree size based on k-fold CV lowest deviance
+    cv.df_current = cv.tree(tree.df_current, K=10)
+    best_size = cv.df_current$size[which.min(cv.df_current$dev)]
+    # prune tree based on best tree size
+    prune.df_current = prune.tree(tree.df_current, best=best_size)
+    pred = predict(tree.df_current,newdata=df_current[-train,])
+    mse[i] = mean((df_current.test - pred)^2)
+  }
+  results[[data_name]] = mean(mse)
+}
+results
+```
+
+## Bagging 
+```{r, cache=TRUE}
+results = list()
+for (data_name in names(datasets)) {
+  df_current <- datasets[[data_name]]
+  set.seed(5)
+  mse = rep(NA,10)
+  # validation set approach: repeat 10 times
+  for (i in 1:10) {
+    train = sample(1:nrow(df_current), nrow(df_current)/2)
+    df_current.test = df_current[-train,"quality"]
+    bag.df_current=randomForest(quality~.,data=df_current,subset=train,mtry=11)
+    pred = predict(bag.df_current,newdata=df_current[-train,])
+    mse[i] = mean((df_current.test - pred)^2)
+  }
+  results[[data_name]] = mean(mse)
+}
+results
+```
+
+## Random Forest 
+```{r, cache=TRUE}
+results = list()
+for (data_name in names(datasets)) {
+  df_current <- datasets[[data_name]]
+  set.seed(5)
+  mse = rep(NA,10)
+  # validation set approach: repeat 10 times
+  for (i in 1:10) {
+    train = sample(1:nrow(df_current), nrow(df_current)/2)
+    df_current.test = df_current[-train,"quality"]
+    rf.df_current=randomForest(quality~.,data=df_current,subset=train,mtry=3)
+    pred = predict(rf.df_current,newdata=df_current[-train,])
+    mse[i] = mean((df_current.test - pred)^2)
+  }
+  results[[data_name]] = mean(mse)
+}
+results
+```
+
+## Boosting 
+```{r, cache=TRUE}
+results = list()
+for (data_name in names(datasets)) {
+  df_current <- datasets[[data_name]]
+  set.seed(5)
+  mse = rep(NA,10)
+  # validation set approach: repeat 10 times
+  for (i in 1:10) {
+    train = sample(1:nrow(df_current), nrow(df_current)/2)
+    df_current.test=df_current[-train,"quality"]
+    boost.df_current=gbm(quality~.,data=df_current[train,],distribution="gaussian")
+    pred=predict(boost.df_current,newdata=df_current[-train,],n.trees=100)
+    mse[i] = mean((df_current.test - pred)^2)
+  }
+  results[[data_name]] = mean(mse)
+  }
+results
+```
+
+
